@@ -1,10 +1,8 @@
 """
-포트폴리오 백테스트 웹앱 (Streamlit)
-- 4가지 입금 시나리오 비교
-- 달러 자산 원화 환산 (KRW=X)
-- 배당/분배금 재투자
-- 반기 리밸런싱 (1월·7월)
-- 모바일 대응 UI
+포트폴리오 백테스트 웹앱 (Streamlit) — 개선판
+- 단계별 설명 UI
+- 차트 + 텍스트 결과 병행 표시
+- Claude API 해석 리포트 자동 생성
 """
 
 import streamlit as st
@@ -18,11 +16,10 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import warnings
 import json
+import requests
 from datetime import date
 
 warnings.filterwarnings("ignore")
-
-# ── 한글 폰트 (서버 환경) ─────────────────────────────────
 plt.rcParams["font.family"] = "DejaVu Sans"
 plt.rcParams["axes.unicode_minus"] = False
 
@@ -36,28 +33,16 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── 모바일 대응 CSS ──────────────────────────────────────
 st.markdown("""
 <style>
-/* 전체 폰트 */
 html, body, [class*="css"] { font-family: 'Segoe UI', sans-serif; }
 
-/* 메트릭 카드 */
 [data-testid="metric-container"] {
     background: #1a1d2e;
     border: 1px solid #2e3250;
     border-radius: 10px;
     padding: 12px 16px;
 }
-
-/* 모바일: 사이드바 기본 닫힘 처리는 Streamlit이 자동 처리 */
-@media (max-width: 768px) {
-    [data-testid="metric-container"] { padding: 8px 10px; }
-    h1 { font-size: 1.4rem !important; }
-    h2 { font-size: 1.1rem !important; }
-}
-
-/* 버튼 */
 .stButton > button {
     width: 100%;
     background: linear-gradient(135deg, #00d4aa, #0098cc);
@@ -70,24 +55,37 @@ html, body, [class*="css"] { font-family: 'Segoe UI', sans-serif; }
 }
 .stButton > button:hover { opacity: 0.88; }
 
-/* 탭 */
-.stTabs [data-baseweb="tab"] { font-size: 0.9rem; }
-
-/* 경고/정보 박스 */
-.info-box {
+.guide-box {
     background: #1a1d2e;
     border-left: 4px solid #00d4aa;
     border-radius: 6px;
-    padding: 10px 14px;
-    margin: 8px 0;
-    font-size: 0.88rem;
+    padding: 12px 16px;
+    margin: 8px 0 16px 0;
+    font-size: 0.9rem;
     color: #c8cad8;
+    line-height: 1.7;
+}
+.section-title {
+    font-size: 1.1rem;
+    font-weight: bold;
+    color: #00d4aa;
+    margin: 20px 0 6px 0;
+}
+.result-card {
+    background: #1a1d2e;
+    border: 1px solid #2e3250;
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-bottom: 12px;
+}
+@media (max-width: 768px) {
+    h1 { font-size: 1.4rem !important; }
 }
 </style>
 """, unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════
-#  기본 설정값 (수정 가능)
+#  기본 설정
 # ════════════════════════════════════════════════════════════
 DEFAULT_TICKERS = {
     "금현물":    "IAU",
@@ -98,24 +96,15 @@ DEFAULT_TICKERS = {
 DEFAULT_IS_USD = {
     "금현물": True, "나스닥100": True, "현금(소파)": True, "한국리츠": False,
 }
-DEFAULT_WEIGHTS = {
-    "금현물": 0.25, "나스닥100": 0.25, "현금(소파)": 0.25, "한국리츠": 0.25,
-}
-DEFAULT_YIELDS = {
-    "금현물": 0.0, "나스닥100": 0.03/12, "현금(소파)": 0.04/12, "한국리츠": 0.065/12,
-}
+PALETTE = ["#00d4aa", "#4fc3f7", "#ffb74d", "#ff6b6b"]
+BG, PANEL, TEXT, GRID = "#0f1117", "#1a1d2e", "#e8eaf0", "#2e3250"
 
-PALETTE = ["#00d4aa", "#4fc3f7", "#ffb74d", "#ff6b6b", "#ce93d8"]
-BG    = "#0f1117"
-PANEL = "#1a1d2e"
-TEXT  = "#e8eaf0"
-GRID  = "#2e3250"
 
 # ════════════════════════════════════════════════════════════
 #  데이터 수집
 # ════════════════════════════════════════════════════════════
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_prices(tickers: dict, is_usd: dict, start: str, end: str) -> pd.DataFrame:
+def fetch_prices(tickers, is_usd, start, end):
     symbols = list(tickers.values())
     raw = yf.download(symbols, start=start, end=end, auto_adjust=False, progress=False)["Close"]
     if isinstance(raw, pd.Series):
@@ -142,13 +131,11 @@ def fetch_prices(tickers: dict, is_usd: dict, start: str, end: str) -> pd.DataFr
 # ════════════════════════════════════════════════════════════
 #  입금 스케줄
 # ════════════════════════════════════════════════════════════
-def build_deposit_schedule(cfg: dict, trade_index: pd.DatetimeIndex) -> pd.Series:
+def build_deposit_schedule(cfg, trade_index):
     deposits = {}
-
     if cfg.get("initial", 0) > 0:
         first_day = trade_index[0]
         deposits[first_day] = deposits.get(first_day, 0) + cfg["initial"]
-
     if cfg.get("dca_amount", 0) > 0 and cfg.get("dca_freq"):
         sched = pd.date_range(trade_index[0], trade_index[-1], freq=cfg["dca_freq"])
         for d in sched:
@@ -157,7 +144,6 @@ def build_deposit_schedule(cfg: dict, trade_index: pd.DatetimeIndex) -> pd.Serie
                 continue
             tday = future[0]
             deposits[tday] = deposits.get(tday, 0) + cfg["dca_amount"]
-
     for date_str, amount in cfg.get("custom_deposits", {}).items():
         d = pd.Timestamp(date_str)
         future = trade_index[trade_index >= d]
@@ -165,19 +151,16 @@ def build_deposit_schedule(cfg: dict, trade_index: pd.DatetimeIndex) -> pd.Serie
             continue
         tday = future[0]
         deposits[tday] = deposits.get(tday, 0) + amount
-
     return pd.Series(deposits).sort_index() if deposits else pd.Series(dtype=float)
 
 
 # ════════════════════════════════════════════════════════════
 #  백테스트 엔진
 # ════════════════════════════════════════════════════════════
-def run_backtest(prices: pd.DataFrame, weights: dict, monthly_yields: dict,
-                 cfg: dict, cost: float):
+def run_backtest(prices, weights, monthly_yields, cfg, cost):
     names = list(weights.keys())
-    w     = np.array([weights[n] for n in names])
+    w      = np.array([weights[n] for n in names])
     my_arr = np.array([monthly_yields[n] for n in names])
-
     deposit_sched = build_deposit_schedule(cfg, prices.index)
 
     rebal_dates = set()
@@ -187,12 +170,11 @@ def run_backtest(prices: pd.DataFrame, weights: dict, monthly_yields: dict,
             if mask.any():
                 rebal_dates.add(prices.index[mask][0])
 
-    shares         = np.zeros(len(names))
-    cash           = 0.0
+    shares = np.zeros(len(names))
+    cash = 0.0
     total_invested = 0.0
-    portfolio_val  = []
-    invested_val   = []
-    prev_month     = None
+    portfolio_val, invested_val = [], []
+    prev_month = None
 
     for date_idx, row in prices.iterrows():
         price_arr  = row[names].values.astype(float)
@@ -204,11 +186,11 @@ def run_backtest(prices: pd.DataFrame, weights: dict, monthly_yields: dict,
             prev_month = date_idx.month
 
         if len(deposit_sched) > 0 and date_idx in deposit_sched.index:
-            inflow          = deposit_sched[date_idx]
-            cash           += inflow
+            inflow = deposit_sched[date_idx]
+            cash += inflow
             total_invested += inflow
-            shares         += (cash * w) / safe_price
-            cash            = 0.0
+            shares += (cash * w) / safe_price
+            cash = 0.0
 
         if date_idx in rebal_dates and shares.sum() > 0:
             current_val   = (shares * price_arr).sum()
@@ -230,33 +212,31 @@ def run_backtest(prices: pd.DataFrame, weights: dict, monthly_yields: dict,
 # ════════════════════════════════════════════════════════════
 #  성과 지표
 # ════════════════════════════════════════════════════════════
-def calc_metrics(pf: pd.Series, inv: pd.Series) -> dict:
+def calc_metrics(pf, inv):
     total_invested = inv.iloc[-1]
     final_val      = pf.iloc[-1]
     total_ret      = (final_val - total_invested) / total_invested if total_invested > 0 else 0
 
-    inv_diff       = inv.diff().fillna(0)
+    inv_diff = inv.diff().fillna(0)
     inv_diff.iloc[0] = inv.iloc[0]
-    cash_flows     = inv_diff[inv_diff > 0] * -1.0
-
+    cash_flows = inv_diff[inv_diff > 0] * -1.0
     if pf.index[-1] in cash_flows.index:
         cash_flows[pf.index[-1]] += final_val
     else:
         cash_flows[pf.index[-1]] = final_val
-
     full_cf = pd.Series(0.0, index=pf.index)
     for d, val in cash_flows.sort_index().items():
         full_cf[d] += val
 
     daily_irr = npf.irr(full_cf.values)
-    cagr      = (1 + daily_irr) ** 252 - 1 if not np.isnan(daily_irr) else 0
+    cagr = (1 + daily_irr) ** 252 - 1 if not np.isnan(daily_irr) else 0
 
-    inv_diff2       = inv.diff().fillna(0)
+    inv_diff2 = inv.diff().fillna(0)
     inv_diff2.iloc[0] = inv.iloc[0]
-    deposit_days    = set(inv_diff2[inv_diff2 > 0].index)
-    daily_chg       = pf.diff().fillna(0)
-    prev_val        = pf.shift(1).bfill()
-    twr             = pd.Series(0.0, index=pf.index)
+    deposit_days = set(inv_diff2[inv_diff2 > 0].index)
+    daily_chg = pf.diff().fillna(0)
+    prev_val  = pf.shift(1).bfill()
+    twr = pd.Series(0.0, index=pf.index)
     for d in pf.index:
         if d in deposit_days or prev_val[d] <= 0:
             continue
@@ -266,8 +246,7 @@ def calc_metrics(pf: pd.Series, inv: pd.Series) -> dict:
     sharpe = (cagr - 0.035) / vol if vol > 0 else 0
     dd     = (pf - pf.cummax()) / pf.cummax()
     mdd    = dd.min()
-
-    years = (pf.index[-1] - pf.index[0]).days / 365.25
+    years  = (pf.index[-1] - pf.index[0]).days / 365.25
 
     return {
         "total_invested": total_invested,
@@ -285,129 +264,215 @@ def calc_metrics(pf: pd.Series, inv: pd.Series) -> dict:
 # ════════════════════════════════════════════════════════════
 #  차트
 # ════════════════════════════════════════════════════════════
-def style_ax(ax):
-    ax.set_facecolor(PANEL)
-    ax.tick_params(colors=TEXT, labelsize=8)
-    ax.xaxis.label.set_color(TEXT)
-    ax.yaxis.label.set_color(TEXT)
-    ax.title.set_color(TEXT)
-    for sp in ax.spines.values():
-        sp.set_edgecolor(GRID)
-    ax.grid(alpha=0.15, color=GRID)
+def make_chart(results):
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), facecolor=BG)
+    fig.subplots_adjust(hspace=0.45)
 
-
-def make_chart(results: dict) -> plt.Figure:
-    active = {k: v for k, v in results.items() if v is not None}
-    n = len(active)
-
-    fig, axes = plt.subplots(2, 1, figsize=(11, 8), facecolor=BG)
-    fig.subplots_adjust(hspace=0.4)
+    def style_ax(ax):
+        ax.set_facecolor(PANEL)
+        ax.tick_params(colors=TEXT, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(GRID)
+        ax.grid(alpha=0.15, color=GRID)
+        ax.yaxis.label.set_color(TEXT)
+        ax.title.set_color(TEXT)
 
     ax1, ax2 = axes
-
-    # 자산가치 vs 투입금
     style_ax(ax1)
-    for i, (name, (pf, inv)) in enumerate(active.items()):
-        c = PALETTE[i % len(PALETTE)]
-        ax1.plot(pf.index, pf / 1e6,  color=c, lw=1.8, label=f"{name} (자산)")
-        ax1.plot(inv.index, inv / 1e6, color=c, lw=0.9, ls=":", alpha=0.65,
-                 label=f"{name} (투입)")
-    ax1.set_title("포트폴리오 자산가치 vs 누적 투입금  (실선=자산, 점선=투입)",
-                  fontsize=10, fontweight="bold", color=TEXT)
-    ax1.set_ylabel("금액 (백만원)", color=TEXT)
-    ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}M"))
-    ax1.legend(facecolor=PANEL, labelcolor=TEXT, fontsize=7,
-               ncol=min(n * 2, 4), loc="upper left")
-
-    # MDD
     style_ax(ax2)
-    for i, (name, (pf, inv)) in enumerate(active.items()):
+
+    for i, (name, (pf, inv)) in enumerate(results.items()):
+        c = PALETTE[i % len(PALETTE)]
+        ax1.plot(pf.index, pf / 1e6, color=c, lw=1.8, label=f"{name}")
+        ax1.plot(inv.index, inv / 1e6, color=c, lw=0.9, ls=":", alpha=0.6)
+
+    ax1.set_title("자산가치 추이  (실선=자산, 점선=투입금)", fontsize=10,
+                  fontweight="bold", color=TEXT)
+    ax1.set_ylabel("금액 (백만원)", color=TEXT)
+    ax1.legend(facecolor=PANEL, labelcolor=TEXT, fontsize=8,
+               ncol=len(results), loc="upper left")
+
+    for i, (name, (pf, inv)) in enumerate(results.items()):
         c  = PALETTE[i % len(PALETTE)]
         dd = (pf - pf.cummax()) / pf.cummax() * 100
-        ax2.fill_between(dd.index, dd, 0, alpha=0.22, color=c)
+        ax2.fill_between(dd.index, dd, 0, alpha=0.2, color=c)
         ax2.plot(dd.index, dd, color=c, lw=1.1, label=name)
+
     ax2.set_title("낙폭(Drawdown) 비교", fontsize=10, fontweight="bold", color=TEXT)
     ax2.set_ylabel("낙폭 (%)", color=TEXT)
-    ax2.legend(facecolor=PANEL, labelcolor=TEXT, fontsize=7, ncol=n)
+    ax2.legend(facecolor=PANEL, labelcolor=TEXT, fontsize=8, ncol=len(results))
 
     return fig
 
 
 # ════════════════════════════════════════════════════════════
-#  UI 헬퍼: 성과 메트릭 카드
+#  텍스트 결과표
 # ════════════════════════════════════════════════════════════
-def show_metrics(m: dict, label: str, color: str):
-    st.markdown(f"<div style='color:{color};font-weight:bold;font-size:1rem;"
-                f"margin-bottom:8px'>▶ {label}</div>", unsafe_allow_html=True)
+def show_text_results(results, weights, monthly_yields, cost, start_date, end_date):
+    st.markdown("### 📋 시나리오별 성과 요약")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("총 투입금",       f"₩{m['total_invested']/1e8:.2f}억")
-    c2.metric("최종 자산",       f"₩{m['final_val']/1e8:.2f}억")
-    c3.metric("수익금",          f"₩{m['profit']/1e6:+,.0f}만",
-              delta=f"{m['total_ret']:+.1f}%")
-    c4.metric("CAGR (IRR)",      f"{m['cagr']:+.2f}%")
+    rows = []
+    for name, (pf, inv) in results.items():
+        m = calc_metrics(pf, inv)
+        rows.append({
+            "시나리오":      name,
+            "총 투입금":     f"₩{m['total_invested']/1e8:.2f}억",
+            "최종 자산":     f"₩{m['final_val']/1e8:.2f}억",
+            "수익금":        f"₩{m['profit']/1e6:+,.0f}만",
+            "누적 수익률":   f"{m['total_ret']:+.2f}%",
+            "CAGR":          f"{m['cagr']:+.2f}%",
+            "연간 변동성":   f"{m['vol']:.2f}%",
+            "샤프 비율":     f"{m['sharpe']:.2f}",
+            "최대 낙폭":     f"{m['mdd']:.2f}%",
+        })
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("연간 변동성",     f"{m['vol']:.2f}%")
-    c6.metric("샤프 비율",       f"{m['sharpe']:.2f}")
-    c7.metric("최대 낙폭 MDD",   f"{m['mdd']:.2f}%")
-    c8.metric("백테스트 기간",   f"{m['years']:.1f}년")
+    df = pd.DataFrame(rows).set_index("시나리오")
+    st.dataframe(df, use_container_width=True)
+
     st.markdown("---")
+    st.markdown("### 📌 시나리오별 상세 지표")
+    for i, (name, (pf, inv)) in enumerate(results.items()):
+        m = calc_metrics(pf, inv)
+        color = PALETTE[i % len(PALETTE)]
+        st.markdown(
+            f"<div class='section-title' style='color:{color}'>▶ {name}</div>",
+            unsafe_allow_html=True
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("총 투입금",   f"₩{m['total_invested']/1e8:.2f}억")
+        c2.metric("최종 자산",   f"₩{m['final_val']/1e8:.2f}억")
+        c3.metric("수익금",      f"₩{m['profit']/1e6:+,.0f}만",
+                  delta=f"{m['total_ret']:+.1f}%")
+        c4.metric("CAGR",        f"{m['cagr']:+.2f}%")
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("연간 변동성", f"{m['vol']:.2f}%")
+        c6.metric("샤프 비율",   f"{m['sharpe']:.2f}")
+        c7.metric("최대 낙폭",   f"{m['mdd']:.2f}%")
+        c8.metric("백테스트 기간", f"{m['years']:.1f}년")
+        st.markdown("")
+
+    return rows
+
+
+# ════════════════════════════════════════════════════════════
+#  Claude AI 해석 리포트
+# ════════════════════════════════════════════════════════════
+def generate_report(results, weights, monthly_yields, cost, start_date, end_date):
+    metrics_summary = []
+    for name, (pf, inv) in results.items():
+        m = calc_metrics(pf, inv)
+        metrics_summary.append(
+            f"[{name}] 투입:{m['total_invested']/1e8:.2f}억 / 최종:{m['final_val']/1e8:.2f}억 / "
+            f"수익률:{m['total_ret']:+.1f}% / CAGR:{m['cagr']:+.2f}% / "
+            f"변동성:{m['vol']:.1f}% / 샤프:{m['sharpe']:.2f} / MDD:{m['mdd']:.1f}%"
+        )
+
+    weight_str = " / ".join([f"{k} {v*100:.0f}%" for k, v in weights.items()])
+    yield_str  = " / ".join([f"{k} {v*12*100:.1f}%" for k, v in monthly_yields.items()])
+
+    prompt = f"""당신은 재무 분석 전문가입니다. 아래 포트폴리오 백테스트 결과를 분석하여 투자자가 이해하기 쉬운 한국어 리포트를 작성해주세요.
+
+[백테스트 조건]
+- 기간: {start_date} ~ {end_date}
+- 포트폴리오 구성: {weight_str}
+- 종목: 금현물(IAU), 나스닥100(QQQ), 현금달러소파(UUP), 한국리츠(맥쿼리인프라 088980.KS)
+- 달러 자산은 원달러 환율 변동 반영 (원화 기준 수익률)
+- 연간 배당/분배금: {yield_str}
+- 반기 리밸런싱 (1월·7월), 수수료 {cost*100:.2f}%
+
+[시나리오별 성과]
+{chr(10).join(metrics_summary)}
+
+위 결과를 바탕으로 다음 구조로 리포트를 작성해주세요:
+
+1. **전체 요약** (3~4문장으로 핵심만)
+2. **시나리오별 분석** (각 시나리오의 특징과 결과 해석)
+3. **포트폴리오 특성 분석** (변동성, 샤프비율, MDD 관점)
+4. **입금 전략별 적합한 투자자 유형**
+5. **주의사항 및 한계점**
+
+전문적이되 일반 투자자도 이해할 수 있는 언어로 작성해주세요. 마크다운 형식으로 작성하세요."""
+
+    response = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"Content-Type": "application/json"},
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=60,
+    )
+    data = response.json()
+    return data["content"][0]["text"]
 
 
 # ════════════════════════════════════════════════════════════
 #  메인 UI
 # ════════════════════════════════════════════════════════════
 st.title("📊 포트폴리오 백테스터")
-st.markdown(
-    '<div class="info-box">'
-    '달러 자산(IAU·QQQ·UUP) → 일별 KRW=X 환율로 <b>원화 환산</b> ｜ '
-    '원화 자산(맥쿼리인프라 088980.KS) → 환산 없음 ｜ '
-    '배당 재투자 · 반기 리밸런싱 포함</div>',
-    unsafe_allow_html=True
-)
 
-# ── 사이드바: 글로벌 설정 ─────────────────────────────────
+st.markdown("""
+<div class="guide-box">
+<b>이 앱은 무엇인가요?</b><br>
+금현물·나스닥100·달러소파·한국리츠로 구성된 분산 포트폴리오의 과거 성과를 시뮬레이션합니다.<br>
+달러 자산은 실제 원달러 환율 변동을 반영하며, 배당 재투자와 반기 리밸런싱이 자동으로 적용됩니다.<br>
+<b>사용 방법:</b> ① 왼쪽 사이드바에서 기본 설정 → ② 시나리오 탭에서 입금 방식 설정 → ③ 백테스트 실행
+</div>
+""", unsafe_allow_html=True)
+
+# ── 사이드바 ─────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ 기본 설정")
 
+    st.markdown("**📅 백테스트 기간**")
     col_s, col_e = st.columns(2)
     start_date = col_s.date_input("시작일", value=date(2016, 1, 1),
                                   min_value=date(2010, 1, 1), max_value=date(2024, 1, 1))
     end_date   = col_e.date_input("종료일", value=date(2025, 6, 30),
                                   min_value=date(2011, 1, 1), max_value=date(2025, 12, 31))
 
-    st.markdown("**비중 설정 (%)**")
-    w_gold   = st.slider("금현물",    0, 100, 25, 5)
-    w_nas    = st.slider("나스닥100", 0, 100, 25, 5)
-    w_cash   = st.slider("현금(소파)", 0, 100, 25, 5)
-    w_reit   = st.slider("한국리츠",  0, 100, 25, 5)
-    total_w  = w_gold + w_nas + w_cash + w_reit
+    st.markdown("---")
+    st.markdown("**⚖️ 자산 비중 (%)**")
+    st.caption("네 자산의 비중 합계가 100%가 되도록 설정하세요. 100%가 아니면 자동 정규화됩니다.")
+    w_gold  = st.slider("🥇 금현물",     0, 100, 25, 5)
+    w_nas   = st.slider("💻 나스닥100",  0, 100, 25, 5)
+    w_cash  = st.slider("💵 현금(소파)", 0, 100, 25, 5)
+    w_reit  = st.slider("🏢 한국리츠",   0, 100, 25, 5)
+    total_w = w_gold + w_nas + w_cash + w_reit
     if total_w != 100:
-        st.warning(f"비중 합계: {total_w}% (100%가 아님 → 자동 정규화)")
+        st.warning(f"비중 합계: {total_w}% → 자동 정규화")
+    else:
+        st.success("비중 합계: 100% ✅")
 
-    weights_raw = {
-        "금현물": w_gold, "나스닥100": w_nas,
-        "현금(소파)": w_cash, "한국리츠": w_reit,
-    }
+    weights_raw = {"금현물": w_gold, "나스닥100": w_nas, "현금(소파)": w_cash, "한국리츠": w_reit}
     weights = {k: v / total_w for k, v in weights_raw.items()}
 
-    st.markdown("**연 배당률 설정 (%)**")
-    y_gold  = st.number_input("금현물 배당",    0.0, 20.0, 0.0,  0.1)
-    y_nas   = st.number_input("나스닥100 배당", 0.0, 20.0, 3.0,  0.1)
-    y_cash  = st.number_input("현금(소파) 배당", 0.0, 20.0, 4.0, 0.1)
-    y_reit  = st.number_input("한국리츠 배당",  0.0, 20.0, 6.5,  0.1)
+    st.markdown("---")
+    st.markdown("**💰 연간 배당/분배금률 (%)**")
+    st.caption("각 자산의 연간 배당 수익률을 입력하세요. 매월 자동 재투자됩니다.")
+    y_gold = st.number_input("🥇 금현물 (무배당)",    0.0, 20.0, 0.0, 0.1)
+    y_nas  = st.number_input("💻 나스닥100 (ACE ETF)", 0.0, 20.0, 3.0, 0.1)
+    y_cash = st.number_input("💵 현금소파 (달러예금)", 0.0, 20.0, 4.0, 0.1)
+    y_reit = st.number_input("🏢 한국리츠 (맥쿼리)",  0.0, 20.0, 6.5, 0.1)
     monthly_yields = {
         "금현물": y_gold/100/12, "나스닥100": y_nas/100/12,
         "현금(소파)": y_cash/100/12, "한국리츠": y_reit/100/12,
     }
 
-    cost = st.slider("리밸런싱 수수료 (%)", 0.0, 2.0, 0.5, 0.05) / 100
-
     st.markdown("---")
-    st.caption("💡 각 시나리오 탭에서 입금 방식을 설정하세요.")
+    st.markdown("**🔄 리밸런싱 수수료**")
+    st.caption("거래금액 기준 수수료율입니다. 1월·7월 첫 거래일에 자동 리밸런싱됩니다.")
+    cost = st.slider("수수료 (%)", 0.0, 2.0, 0.5, 0.05) / 100
 
 # ── 시나리오 탭 ──────────────────────────────────────────
+st.markdown("### 💼 입금 시나리오 설정")
+st.markdown("""
+<div class="guide-box">
+아래 4가지 탭에서 각 시나리오의 입금 방식을 설정합니다. 여러 시나리오를 동시에 활성화하면 나란히 비교할 수 있습니다.
+</div>
+""", unsafe_allow_html=True)
+
 tab_a, tab_b, tab_c, tab_d = st.tabs([
     "💰 A: 일시납", "📅 B: 월적립", "🔀 C: 혼합", "🛠️ D: 커스텀"
 ])
@@ -415,46 +480,37 @@ tab_a, tab_b, tab_c, tab_d = st.tabs([
 scenarios = {}
 
 with tab_a:
-    st.subheader("A. 일시납")
-    st.markdown("전체 자금을 첫날 한 번에 투입하는 시나리오입니다.")
+    st.markdown("**💰 일시납** — 전체 자금을 첫날 한 번에 투입하는 방식입니다. 투자 시점의 중요성을 확인할 수 있습니다.")
     en_a  = st.checkbox("이 시나리오 활성화", value=True, key="en_a")
     ini_a = st.number_input("초기 투입금 (원)", 0, 10_000_000_000,
-                             100_000_000, 1_000_000, key="ini_a",
-                             format="%d")
+                             100_000_000, 1_000_000, key="ini_a", format="%d")
     st.caption(f"= ₩{ini_a/1e8:.2f}억")
-    scenarios["일시납"] = {"enabled": en_a, "initial": ini_a,
-                           "dca_amount": 0, "dca_freq": None}
+    scenarios["일시납"] = {"enabled": en_a, "initial": ini_a, "dca_amount": 0, "dca_freq": None}
 
 with tab_b:
-    st.subheader("B. 월적립 (DCA)")
-    st.markdown("첫날부터 매월 일정 금액을 적립하는 시나리오입니다.")
+    st.markdown("**📅 월적립 (DCA)** — 매월 일정 금액을 꾸준히 투자하는 방식입니다. 시장 평균 매입 단가를 낮추는 효과가 있습니다.")
     en_b  = st.checkbox("이 시나리오 활성화", value=True, key="en_b")
     dca_b = st.number_input("월 적립금 (원)", 0, 100_000_000,
                              3_000_000, 500_000, key="dca_b", format="%d")
-    st.caption(f"= 월 ₩{dca_b/1e4:.0f}만 → 연 ₩{dca_b*12/1e8:.2f}억")
-    scenarios["월적립"] = {"enabled": en_b, "initial": 0,
-                           "dca_amount": dca_b, "dca_freq": "MS"}
+    st.caption(f"월 ₩{dca_b/1e4:.0f}만 × 12 = 연 ₩{dca_b*12/1e8:.2f}억")
+    scenarios["월적립"] = {"enabled": en_b, "initial": 0, "dca_amount": dca_b, "dca_freq": "MS"}
 
 with tab_c:
-    st.subheader("C. 혼합 (목돈 + 월적립)")
-    st.markdown("초기 목돈을 투입한 후, 추가로 매월 적립하는 시나리오입니다.")
+    st.markdown("**🔀 혼합** — 초기 목돈을 투입한 후 매월 추가 적립하는 방식입니다. 목돈과 적립의 시너지를 확인할 수 있습니다.")
     en_c  = st.checkbox("이 시나리오 활성화", value=True, key="en_c")
     ini_c = st.number_input("초기 투입금 (원)", 0, 10_000_000_000,
                              50_000_000, 1_000_000, key="ini_c", format="%d")
     dca_c = st.number_input("월 추가 적립금 (원)", 0, 100_000_000,
                              2_000_000, 500_000, key="dca_c", format="%d")
     st.caption(f"초기 ₩{ini_c/1e8:.2f}억 + 월 ₩{dca_c/1e4:.0f}만")
-    scenarios["혼합"] = {"enabled": en_c, "initial": ini_c,
-                         "dca_amount": dca_c, "dca_freq": "MS"}
+    scenarios["혼합"] = {"enabled": en_c, "initial": ini_c, "dca_amount": dca_c, "dca_freq": "MS"}
 
 with tab_d:
-    st.subheader("D. 커스텀 (비정기 입금)")
-    st.markdown("초기 투입 외에 특정 날짜에 비정기적으로 입금하는 시나리오입니다.")
+    st.markdown("**🛠️ 커스텀** — 특정 시점에 비정기적으로 입금하는 방식입니다. 보너스·연말정산 환급 등 실제 입금 패턴을 재현할 수 있습니다.")
     en_d  = st.checkbox("이 시나리오 활성화", value=True, key="en_d")
     ini_d = st.number_input("초기 투입금 (원)", 0, 10_000_000_000,
                              30_000_000, 1_000_000, key="ini_d", format="%d")
-
-    st.markdown("**비정기 입금 일정** (날짜: YYYY-MM-DD, 금액: 원)")
+    st.markdown("**비정기 입금 일정** — 한 줄에 하나씩 `날짜: 금액` 형식으로 입력하세요.")
     default_custom = (
         "2022-04-01: 10000000\n"
         "2022-10-01: 15000000\n"
@@ -462,9 +518,7 @@ with tab_d:
         "2023-09-01: 20000000\n"
         "2024-01-01:  5000000"
     )
-    custom_text = st.text_area("입금 스케줄 (한 줄에 하나씩)", default_custom,
-                               height=150, key="custom_text")
-
+    custom_text = st.text_area("입금 스케줄", default_custom, height=150, key="custom_text")
     custom_deposits = {}
     for line in custom_text.strip().split("\n"):
         line = line.strip()
@@ -477,30 +531,30 @@ with tab_d:
             custom_deposits[d_str] = amt
         except Exception:
             pass
-
     total_custom = sum(custom_deposits.values())
-    st.caption(f"비정기 입금 합계: ₩{total_custom/1e4:.0f}만 ({len(custom_deposits)}건) "
-               f"| 총 투입 예상: ₩{(ini_d + total_custom)/1e8:.2f}억")
-
+    st.caption(f"비정기 입금 합계: ₩{total_custom/1e4:.0f}만 ({len(custom_deposits)}건) / 총 예상 투입: ₩{(ini_d+total_custom)/1e8:.2f}억")
     scenarios["커스텀"] = {
-        "enabled": en_d,
-        "initial": ini_d,
-        "dca_amount": 0,
-        "dca_freq": None,
-        "custom_deposits": custom_deposits,
+        "enabled": en_d, "initial": ini_d, "dca_amount": 0,
+        "dca_freq": None, "custom_deposits": custom_deposits,
     }
 
 # ── 실행 버튼 ─────────────────────────────────────────────
 st.markdown("---")
-run_btn = st.button("🚀 백테스트 실행", use_container_width=True)
+run_col, report_col = st.columns([3, 1])
+with run_col:
+    run_btn = st.button("🚀 백테스트 실행", use_container_width=True)
+with report_col:
+    report_btn = st.button("🤖 AI 해석 리포트", use_container_width=True,
+                            help="백테스트 실행 후 클릭하세요")
 
-if run_btn:
+# ── 백테스트 실행 ─────────────────────────────────────────
+if run_btn or report_btn:
     enabled = {k: v for k, v in scenarios.items() if v.get("enabled", False)}
     if not enabled:
         st.warning("최소 1개 이상의 시나리오를 활성화하세요.")
         st.stop()
 
-    with st.spinner("📡 야후파이낸스 데이터 수신 중..."):
+    with st.spinner("📡 시장 데이터 수신 중... (최대 30초 소요)"):
         try:
             prices, fx = fetch_prices(
                 DEFAULT_TICKERS, DEFAULT_IS_USD,
@@ -510,78 +564,69 @@ if run_btn:
             st.error(f"데이터 수집 실패: {e}")
             st.stop()
 
-    # 환율 정보
     st.markdown(
-        f'<div class="info-box">📈 환율 정보: '
-        f'{str(start_date)[:7]} ≈ <b>{fx.iloc[0]:.0f}원</b> → '
+        f'<div class="guide-box">📈 환율: {str(start_date)[:7]} ≈ <b>{fx.iloc[0]:.0f}원</b> → '
         f'{str(end_date)[:7]} ≈ <b>{fx.iloc[-1]:.0f}원</b> '
-        f'(변화: {(fx.iloc[-1]/fx.iloc[0]-1)*100:+.1f}%)</div>',
+        f'(변화: {(fx.iloc[-1]/fx.iloc[0]-1)*100:+.1f}%) — 달러 자산 수익률에 환율 변동이 반영되어 있습니다.</div>',
         unsafe_allow_html=True
     )
 
-    results = {}
-    with st.spinner("⚙️ 시나리오별 백테스트 계산 중..."):
+    with st.spinner("⚙️ 백테스트 계산 중..."):
+        results = {}
         for name, cfg in enabled.items():
             pf, inv = run_backtest(prices, weights, monthly_yields, cfg, cost)
             results[name] = (pf, inv)
 
     # 차트
-    st.subheader("📈 시나리오 비교 차트")
-    fig = make_chart(results)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+    st.markdown("### 📈 시나리오 비교 차트")
+    try:
+        fig = make_chart(results)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+    except Exception as e:
+        st.warning(f"차트 렌더링 오류: {e} — 텍스트 결과를 확인하세요.")
 
-    # 성과 지표
-    st.subheader("📋 시나리오별 성과 요약")
-    for i, (name, (pf, inv)) in enumerate(results.items()):
-        m = calc_metrics(pf, inv)
-        show_metrics(m, name, PALETTE[i % len(PALETTE)])
-
-    # 비교 테이블
-    st.subheader("📊 시나리오 한눈 비교")
-    rows = []
-    for name, (pf, inv) in results.items():
-        m = calc_metrics(pf, inv)
-        rows.append({
-            "시나리오":    name,
-            "총 투입금":   f"₩{m['total_invested']/1e8:.2f}억",
-            "최종 자산":   f"₩{m['final_val']/1e8:.2f}억",
-            "수익금":      f"₩{m['profit']/1e6:+,.0f}만",
-            "수익률":      f"{m['total_ret']:+.2f}%",
-            "CAGR":        f"{m['cagr']:+.2f}%",
-            "변동성":      f"{m['vol']:.2f}%",
-            "샤프":        f"{m['sharpe']:.2f}",
-            "MDD":         f"{m['mdd']:.2f}%",
-        })
-    df_cmp = pd.DataFrame(rows).set_index("시나리오")
-    st.dataframe(df_cmp, use_container_width=True)
+    # 텍스트 결과
+    show_text_results(results, weights, monthly_yields, cost, start_date, end_date)
 
     # JSON 다운로드
     json_out = {}
     for name, (pf, inv) in results.items():
-        m    = calc_metrics(pf, inv)
-        pf_m = pf.resample("ME").last()
+        m     = calc_metrics(pf, inv)
+        pf_m  = pf.resample("ME").last()
         inv_m = inv.resample("ME").last()
         dd_m  = ((pf - pf.cummax()) / pf.cummax()).resample("ME").last()
         json_out[name] = {
-            "metrics": {k: round(v, 2) for k, v in m.items()},
+            "metrics":   {k: round(v, 2) for k, v in m.items()},
             "dates":     [d.strftime("%Y-%m") for d in pf_m.index],
             "portfolio": [round(v) for v in pf_m.values],
             "invested":  [round(v) for v in inv_m.values],
             "drawdown":  [round(v * 100, 2) for v in dd_m.values],
         }
-    json_bytes = json.dumps(json_out, ensure_ascii=False, indent=2).encode("utf-8")
     st.download_button(
         label="⬇️ 결과 JSON 다운로드",
-        data=json_bytes,
+        data=json.dumps(json_out, ensure_ascii=False, indent=2).encode("utf-8"),
         file_name="backtest_results.json",
         mime="application/json",
-        use_container_width=True,
     )
+
+    # AI 해석 리포트
+    if report_btn:
+        st.markdown("---")
+        st.markdown("### 🤖 AI 해석 리포트")
+        with st.spinner("리포트 생성 중..."):
+            try:
+                report = generate_report(results, weights, monthly_yields,
+                                         cost, start_date, end_date)
+                st.markdown(report)
+            except Exception as e:
+                st.error(f"리포트 생성 실패: {e}")
 
 # ── 푸터 ─────────────────────────────────────────────────
 st.markdown("---")
 st.caption(
-    "데이터 출처: Yahoo Finance ｜ 달러 자산(IAU·QQQ·UUP) → KRW=X 환율 원화 환산 ｜ "
-    "088980.KS(맥쿼리인프라) → 원화 직접 ｜ 투자 참고용이며 실제 수익을 보장하지 않습니다."
+    "데이터 출처: Yahoo Finance ｜ "
+    "달러 자산(IAU·QQQ·UUP) → KRW=X 환율 원화 환산 ｜ "
+    "088980.KS(맥쿼리인프라) → 원화 직접 ｜ "
+    "본 앱은 투자 참고용이며 실제 수익을 보장하지 않습니다."
 )
